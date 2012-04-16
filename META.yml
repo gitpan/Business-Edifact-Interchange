@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Business-Edifact-Interchange
-version:            0.02
+version:            0.03
 abstract:           Parse Edifact Messages For Book Ordering
 author:
     - Colin Campbell <colinsc@cpan.org>
