@@ -3,7 +3,6 @@ package Business::Edifact::Interchange;
 use warnings;
 use strict;
 use 5.010;
-use feature 'switch';
 use Carp;
 use Encode;
 use Business::Edifact::Message;
@@ -14,11 +13,11 @@ Business::Edifact::Interchange - Parse Edifact Messages For Book Ordering
 
 =head1 VERSION
 
-Version 0.05
+Version 0.06
 
 =cut
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 #  UNOA and UNOB "correspond to the basic ascii sets of iso 646 and iso 6937"
 # Version 4 of edifact should extend this to unicode
@@ -112,28 +111,26 @@ sub parse {
         my ( $tag, @data ) =
           split /(?<!$self->{separator}->{release})$self->{separator}->{data}/,
           $segment;
-        given ($tag) {
-            when (/UNH/) {
-                $current_msg = $self->message_header(@data);
-                next;
-            }
-            when (/UNT/) {
-                $self->message_trailer( $current_msg, @data );
-                $current_msg = undef;
-                next;
-            }
-            when (/^UNZ/) {
-                $self->interchange_trailer(@data);
-                next;
-            }
-            when (/^UNG/) {
-                $self->message_group_header(@data);
-                next;
-            }
-            when (/^UNE/) {
-                $self->message_group_trailer(@data);
-                next;
-            }
+        if ( $tag =~ /UNH/ ) {
+            $current_msg = $self->message_header(@data);
+            next;
+        }
+        if ( $tag =~ /UNT/ ) {
+            $self->message_trailer( $current_msg, @data );
+            $current_msg = undef;
+            next;
+        }
+        if ( $tag =~ /^UNZ/ ) {
+            $self->interchange_trailer(@data);
+            next;
+        }
+        if ( $tag =~ /^UNG/ ) {
+            $self->message_group_header(@data);
+            next;
+        }
+        if ( $tag =~ /^UNE/ ) {
+            $self->message_group_trailer(@data);
+            next;
         }
 
         $self->user_data_segment( $current_msg, $tag, @data );
