@@ -12,11 +12,11 @@ Business::Edifact::Message - Class that models Edifact Messages
 
 =head1 VERSION
 
-Version 0.06
+Version 0.07
 
 =cut
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 =head1 SYNOPSIS
 
@@ -83,6 +83,7 @@ sub _init_sh {
         UNS => \&handle_uns,
         CNT => \&handle_cnt,
         FTX => \&handle_ftx,
+        PCD => \&handle_pcd,
     };
 }
 
@@ -214,13 +215,16 @@ NB DTM can occur in different segment groups
 sub handle_dtm {
     my ( $self, $data_arr ) = @_;
     my ( $qualifier, $date, $format ) = @{ $data_arr->[0] };
+    if ( length $date == 6 ) {    # century missing
+        $date = "20$date";
+    }
     if ( $self->{segment_group} == 0 ) {    # message header
                                             #TBD standard allows 35 repeats
         if ( $qualifier == 137 ) {
             $self->{message_date} = $date;
         }
         elsif ( $qualifier == 36 ) {
-            $self->{expirty_date} = $date;
+            $self->{expiry_date} = $date;
         }
         elsif ( $qualifier == 131 ) {
             $self->{tax_point_date} = $date;
@@ -245,6 +249,9 @@ sub handle_pat {    # invoices only
         $self->{payment_terms} = {
             type  => 'basic',
             terms => $data_arr->[2],
+
+            # terms time_reference_code|Time relation|Type of period[D = days]
+            # number of periods
         };
     }
     elsif ( $data_arr->[0]->[0] == 3 ) {
@@ -259,8 +266,21 @@ sub handle_pat {    # invoices only
 
 sub handle_rff {
     my ( $self, $data_arr ) = @_;
-    if ( $data_arr->[0]->[0] eq 'VA' ) {
+    my $ref_qualifier = $data_arr->[0]->[0];
+    if ( $ref_qualifier eq 'VA' ) {
         $self->{supplier_vat_number} = $data_arr->[0]->[1];
+    }
+    elsif ( $ref_qualifier eq 'API' ) {
+        $self->{additional_party_id} = $data_arr->[0]->[1];
+    }
+    elsif ( $ref_qualifier eq 'FC' ) {
+        $self->{fiscal_number} = $data_arr->[0]->[1];
+    }
+    elsif ( $ref_qualifier eq 'IA' ) {
+        $self->{internal_vendor_number} = $data_arr->[0]->[1];
+    }
+    elsif ( $ref_qualifier eq 'TL' ) {
+        $self->{tax_exemption_licence} = $data_arr->[0]->[1];
     }
     if ( $self->{segment_group} == 0 ) {
         $self->{segment_group}     = 1;    # 1 mandatory occurence
@@ -278,6 +298,17 @@ sub handle_rff {
     }
     elsif ( $self->{segment_group} == 27 ) {    # ref to an address (SG12)
         $self->{lines}->[-1]->addsegment( 'item_reference', $data_arr );
+    }
+    elsif ( $self->{segment_group} == 25 ) {    # Buyer's orderline number
+        if ( $ref_qualifier eq 'LI' ) {
+            $self->{lines}->[-1]->{buyers_refnumber} = $data_arr->[0]->[1];
+            if ( $data_arr->[0]->[2] ) {
+                $self->{lines}->[-1]->{buyers_ref_lineno} = $data_arr->[0]->[2];
+            }
+        }
+        else {
+            $self->{lines}->[-1]->addsegment( 'item_reference', $data_arr );
+        }
     }
     else {
         push @{ $self->{reference} },
@@ -323,7 +354,13 @@ sub handle_nad {
 
 sub handle_lin {
     my ( $self, $data_arr ) = @_;
-    $self->{segment_group} = 27;
+    $self->clear_item_flags();
+    if ( $self->{type} eq 'INVOIC' ) {
+        $self->{segment_group} = 25;
+    }
+    else {
+        $self->{segment_group} = 27;
+    }
     my $line = {
         line_number            => $data_arr->[0]->[0],
         action_req             => $data_arr->[1]->[0],
@@ -349,6 +386,28 @@ sub handle_lin {
 sub handle_pia {
     my ( $self, $data_arr ) = @_;
     $self->{lines}->[-1]->addsegment( 'additional_product_ids', $data_arr );
+    if ( $self->{segment_group} == 25 ) {
+
+        # For invoice may well be the item identifier
+        if ( $data_arr->[0]->[0] eq '5' ) {    #alphanum as 5V is valid
+            my %id_type = (
+                IB => 'ISBN',
+                IM => 'ISMN',
+                IN => 'Purchasers_ID',
+                IS => 'ISSN',
+                MF => 'Manufacturers_Number',
+                SA => 'Suppliers_Number',
+            );
+            my $t = $data_arr->[1]->[1];
+            if ( exists $id_type{$t} ) {
+                $t = $id_type{$t};
+            }
+            $self->{lines}->[-1]->{item_ID_number} = {
+                number => $data_arr->[1]->[0],
+                type   => $t,
+            };
+        }
+    }
     return;
 }
 
@@ -382,11 +441,12 @@ sub handle_qty {
     if ( $self->type eq 'INVOIC' ) {
         my $code = $data_arr->[0]->[0];
         if ( $code == 47 ) {
-            $self->{lines}->[-1]->{quantity_invoiced} = $data_arr->[0]->[1];
-        }
-        elsif ( $code == 11 ) {
-            $self->{lines}->[-1]->{place_of_delivery}->[-1]
-              ->{split_delivery_quantity} = $data_arr->[0]->[1];
+            if ( $self->{segment_group} == 25 ) {    # item level
+                $self->{lines}->[-1]->{quantity_invoiced} = $data_arr->[0]->[1];
+            }
+            else {
+                $self->{quantity_invoiced} = $data_arr->[0]->[1];
+            }
         }
     }
     else {
@@ -424,8 +484,27 @@ sub handle_gir {
 
 sub handle_moa {
     my ( $self, $data_arr ) = @_;
-    if ( $self->{segment_group} == 27 ) {
-        if ( !$self->{item_alc_flag} ) {
+    if ( $self->{segment_group} == 27 || $self->{segment_group} == 25 ) {
+        if ( $data_arr->[0]->[0] == 203 ) {
+            $self->{lines}->[-1]->{lineitem_amount} = $data_arr->[0]->[1];
+        }
+        elsif ( $data_arr->[0]->[0] == 128 ) {
+            $self->{lines}->[-1]->{lineitem_total_amount} =
+              $data_arr->[0]->[1];
+        }
+        elsif ( $data_arr->[0]->[0] == 52 ) {
+            $self->{lines}->[-1]->{lineitem_discount_amount} =
+              $data_arr->[0]->[1];
+        }
+        elsif ( $data_arr->[0]->[0] == 146 ) {
+            $self->{lines}->[-1]->{lineitem_unit_price} =
+              $data_arr->[0]->[1];
+        }
+        elsif ( $self->{item_alc_flag} ) {
+            $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{amount} =
+              $data_arr->[0]->[1];
+        }
+        else {
             my $data = shift @{$data_arr};
             my $ma   = {
                 qualifier => $data->[0],
@@ -433,10 +512,6 @@ sub handle_moa {
             };
 
             push @{ $self->{lines}->[-1]->{monetary_amount} }, $ma;
-        }
-        else {
-            $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{amount} =
-              $data_arr->[0]->[1];
         }
     }
     else {
@@ -467,21 +542,18 @@ sub handle_moa {
 
 sub handle_tax {
     my ( $self, $data_arr ) = @_;
-    if ( $self->{segment_group} == 27 ) {
+
+    my $tax = {
+        function_code => $data_arr->[0]->[0],
+        type_code     => $data_arr->[1]->[0],
+        rate          => $data_arr->[4]->[3],
+        category_code => $data_arr->[5]->[0],
+    };
+    if ( $self->{segment_group} == 27 || $self->{segment_group} == 25 ) {
         if ( !$self->{item_alc_flag} ) {
-            my $tax = {
-                type_code     => $data_arr->[1]->[0],
-                rate          => $data_arr->[4]->[3],
-                category_code => $data_arr->[5]->[0],
-            };
-            push @{ $self->{lines}->[-1]->{item_tax} }, $tax;
+            push @{ $self->{lines}->[-1]->{tax} }, $tax;
         }
         else {
-            my $tax = {
-                type_code     => $data_arr->[1]->[0],
-                rate          => $data_arr->[4]->[3],
-                category_code => $data_arr->[5]->[0],
-            };
             push
               @{ $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{tax}
               }, $tax;
@@ -489,11 +561,6 @@ sub handle_tax {
         }
     }
     else {
-        my $tax = {
-            type_code     => $data_arr->[1]->[0],
-            rate          => $data_arr->[4]->[3],
-            category_code => $data_arr->[5]->[0],
-        };
         push @{ $self->{tax} }, $tax;
     }
     return;
@@ -505,7 +572,7 @@ sub handle_tax {
 
 sub handle_alc {
     my ( $self, $data_arr ) = @_;
-    if ( $self->{segment_group} == 27 ) {
+    if ( $self->{segment_group} == 27 || $self->{segment_group} == 25 ) {
         my $alc = {
             type         => $data_arr->[0]->[0],
             sequence     => $data_arr->[3]->[0],
@@ -532,10 +599,12 @@ sub handle_alc {
 
 sub handle_rte {
     my ( $self, $data_arr ) = @_;
-    if ( $self->{item_alc_flag} == 1 ) {
-        $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{rate} =
-          $data_arr->[0]->[1];
-        delete $self->{item_alc_flag};
+    if ( $self->{type} ne 'INVOIC' ) {
+        if ( $self->{item_alc_flag} == 1 ) {
+            $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{rate} =
+              $data_arr->[0]->[1];
+            delete $self->{item_alc_flag};
+        }
     }
     return;
 }
@@ -581,6 +650,7 @@ sub handle_pri {
 sub handle_uns {
     my ( $self, $data_arr ) = @_;
     $self->{segment_group} = -1;    # summary does not have a seg group
+    $self->clear_item_flags();
     return;
 }
 
@@ -614,8 +684,36 @@ sub handle_ftx {
         $self->{lines}->[-1]->{free_text} = $text_field;
     }
     else {
-        push $self->{free_text}, $text_field;
+        push @{ $self->{free_text} }, $text_field;
     }
+    return;
+}
+
+=head2 handle_pcd
+
+=cut
+
+sub handle_pcd {
+    my ( $self, $data_arr ) = @_;
+    if ( $self->{item_alc_flag} ) {
+        $self->{lines}->[-1]->{item_allowance_or_charge}->[-1]->{percentage} =
+          $data_arr->[0]->[1];
+        delete $self->{item_alc_flag};
+    }
+    return;
+
+}
+
+=head2 clear_item_flags
+
+ clear flags at start of new item or summary
+
+=cut
+
+sub clear_item_flags {
+    my $self = shift;
+    delete $self->{item_locqty_flag};
+    delete $self->{item_alc_flag};
     return;
 }
 
@@ -644,7 +742,7 @@ You can find documentation for this module with the perldoc command.
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright 2011 Colin Campbell.
+Copyright 2011-2014 Colin Campbell.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of either: the GNU General Public License as published
